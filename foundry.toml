@@ -7,12 +7,21 @@ via-ir = true
 optimizer = true
 optimizer_runs = 1
 evm_version = "cancun"
-fs_permissions = [{ access = "read-write", path = "./deployments/"}]
+fs_permissions = [{ access = "read-write", path = "./deployments/" }, { access = "read", path = "./lib/pyusdx/out/" }]
 block_gas_limit = 10000000000
 ignored_warnings_from = ["test"]
 
 [profile.lite.optimizer_details.yulDetails]
 optimizerSteps = ''
+
+[profile.pyusdx]
+solc = "0.8.34"
+src = "lib/pyusdx/src"
+out = "out-pyusdx"
+libs = ["lib/pyusdx/lib"]
+optimizer = true
+optimizer_runs = 4999
+evm_version = "cancun"
 
 [fmt]
 bracket_spacing = false
@@ -24,4 +33,11 @@ tab_width = 4
 wrap_comments = true
 
 [lint]
-exclude_lints = ["mixed-case-variable", "unaliased-plain-import", "mixed-case-function", "screaming-snake-case-immutable", "erc20-unchecked-transfer", "unwrapped-modifier-logic"]
+exclude_lints = [
+  "mixed-case-variable",
+  "unaliased-plain-import",
+  "mixed-case-function",
+  "screaming-snake-case-immutable",
+  "erc20-unchecked-transfer",
+  "unwrapped-modifier-logic",
+]

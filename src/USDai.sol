@@ -2,7 +2,7 @@
 pragma solidity 0.8.29;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import "@openzeppelin/contracts-upgradeable/utils/introspection/ERC165Upgradeable.sol";
@@ -15,9 +15,10 @@ import "@openzeppelin/contracts-upgradeable/utils/MulticallUpgradeable.sol";
 import "./interfaces/IUSDai.sol";
 import "./interfaces/ISwapAdapter.sol";
 import "./interfaces/IMintableBurnable.sol";
-import "./interfaces/IBaseYieldEscrow.sol";
 
 import "./interfaces/external/IBlacklist.sol";
+import "./interfaces/external/IMultiMint.sol";
+import "./interfaces/external/ISwapFacility.sol";
 
 /**
  * @title USDai ERC20
@@ -42,7 +43,7 @@ contract USDai is
     /**
      * @notice Implementation version
      */
-    string public constant IMPLEMENTATION_VERSION = "1.4";
+    string public constant IMPLEMENTATION_VERSION = "1.5";
 
     /**
      * @notice Bridge admin role
@@ -53,11 +54,6 @@ contract USDai is
      * @notice Deposit admin role
      */
     bytes32 internal constant DEPOSIT_ADMIN_ROLE = keccak256("DEPOSIT_ADMIN_ROLE");
-
-    /**
-     * @notice Convert base token admin role
-     */
-    bytes32 internal constant CONVERT_BASE_TOKEN_ADMIN_ROLE = keccak256("CONVERT_BASE_TOKEN_ADMIN_ROLE");
 
     /**
      * @notice Blacklist admin role
@@ -72,7 +68,7 @@ contract USDai is
         0x5fc387bd350b82c09f22bee4c04d61669980ce519c352560e36bc6144f9cf800;
 
     /**
-     * @notice Base yield accrual storage location
+     * @notice Base yield accrual storage location (DEAD — kept for storage layout compatibility)
      * @dev keccak256(abi.encode(uint256(keccak256("USDai.baseYieldAccrual")) - 1)) & ~bytes32(uint256(0xff));
      */
     bytes32 private constant BASE_YIELD_ACCRUAL_STORAGE_LOCATION =
@@ -86,9 +82,9 @@ contract USDai is
         0xd21f45001ca28b8905ef527bd860800b2646ce7faf578b00aa2e89af23551500;
 
     /**
-     * @notice Fixed point scale
+     * @notice PYUSD on Arbitrum
      */
-    uint256 private constant FIXED_POINT_SCALE = 1e18;
+    address private constant PYUSD = 0x46850aD61C2B7d64d08c9C754F45254596696984;
 
     /*------------------------------------------------------------------------*/
     /* Immutable state */
@@ -100,7 +96,7 @@ contract USDai is
     ISwapAdapter internal immutable _swapAdapter;
 
     /**
-     * @notice Base token
+     * @notice Base token (MultiMint)
      */
     IERC20 internal immutable _baseToken;
 
@@ -110,14 +106,14 @@ contract USDai is
     uint256 internal immutable _scaleFactor;
 
     /**
-     * @notice Base yield escrow
-     */
-    IBaseYieldEscrow internal immutable _baseYieldEscrow;
-
-    /**
-     * @notice Base yield recipient
+     * @notice Base yield recipient (sUSDai)
      */
     address internal immutable _baseYieldRecipient;
+
+    /**
+     * @notice Swap facility (for PYUSD → MultiMint migration)
+     */
+    address internal immutable _swapFacility;
 
     /*------------------------------------------------------------------------*/
     /* Constructor */
@@ -126,17 +122,21 @@ contract USDai is
     /**
      * @notice USDai Constructor
      * @param swapAdapter_ Swap Adapter
-     * @param baseYieldEscrow_ Base token yield escrow
      * @param baseYieldRecipient_ Base yield recipient
+     * @param swapFacility_ PYUSDX SwapFacility address
      */
-    constructor(address swapAdapter_, address baseYieldEscrow_, address baseYieldRecipient_) {
+    constructor(
+        address swapAdapter_,
+        address baseYieldRecipient_,
+        address swapFacility_
+    ) {
         _disableInitializers();
 
         _swapAdapter = ISwapAdapter(swapAdapter_);
         _baseToken = IERC20(_swapAdapter.baseToken());
         _scaleFactor = 10 ** (18 - IERC20Metadata(_swapAdapter.baseToken()).decimals());
-        _baseYieldEscrow = IBaseYieldEscrow(baseYieldEscrow_);
         _baseYieldRecipient = baseYieldRecipient_;
+        _swapFacility = swapFacility_;
     }
 
     /*------------------------------------------------------------------------*/
@@ -158,6 +158,32 @@ contract USDai is
 
         /* Grant roles */
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
+    }
+
+    /**
+     * @notice V1.5 migration: atomically wraps PYUSD → MultiMint
+     * @dev    Called via upgradeAndCall during the v1.5 upgrade.
+     */
+    function initializeV1_5() public reinitializer(3) {
+        IERC20 pyusd = IERC20(PYUSD);
+
+        uint256 pyusdBalance = pyusd.balanceOf(address(this));
+        if (pyusdBalance == 0) revert InvalidAmount();
+
+        /* Approve SwapFacility to pull PYUSD */
+        pyusd.forceApprove(_swapFacility, pyusdBalance);
+
+        /* Wrap PYUSD → MultiMint, delivered to this contract 1:1 */
+        uint256 mintedBefore = _baseToken.balanceOf(address(this));
+
+        ISwapFacility(_swapFacility).swap(PYUSD, address(_baseToken), pyusdBalance, address(this));
+
+        uint256 minted = _baseToken.balanceOf(address(this)) - mintedBefore;
+
+        /* Solvency assertion: USDai (18d) totalSupply ≤ MultiMint balance × 10^12 */
+        if (_scale(minted) < totalSupply() + bridgedSupply()) revert InsufficientBacking();
+
+        emit Migrated("PYUSD -> MultiMint", abi.encode(pyusdBalance, minted));
     }
 
     /*------------------------------------------------------------------------*/
@@ -233,11 +259,10 @@ contract USDai is
 
     /**
      * @inheritdoc IUSDai
+     * @dev Returns the pending yield from MultiMint, scaled to 18 decimals.
      */
     function baseYieldAccrued() external view returns (uint256) {
-        BaseYieldAccrual memory accrual = _getBaseYieldAccrualStorage();
-
-        return accrual.accrued + _calculateAccrual(accrual);
+        return _scale(IMultiMint(address(_baseToken)).yield());
     }
 
     /**
@@ -348,9 +373,6 @@ contract USDai is
         address recipient,
         bytes calldata data
     ) internal nonZeroUint(depositAmount) nonZeroAddress(recipient) returns (uint256) {
-        /* Accrue base yield */
-        _accrue();
-
         /* Transfer token in from sender to this contract */
         IERC20(depositToken).safeTransferFrom(msg.sender, address(this), depositAmount);
 
@@ -396,9 +418,6 @@ contract USDai is
         address recipient,
         bytes calldata data
     ) internal nonZeroUint(usdaiAmount) nonZeroAddress(recipient) returns (uint256) {
-        /* Accrue base yield */
-        _accrue();
-
         /* Burn USD.ai tokens */
         _burn(msg.sender, usdaiAmount);
 
@@ -423,55 +442,6 @@ contract USDai is
         emit Withdrawn(msg.sender, recipient, withdrawToken, usdaiAmount, withdrawAmount);
 
         return withdrawAmount;
-    }
-
-    /**
-     * @notice Calculate interest accrued
-     * @param accrual Base yield accrual
-     * @return Scaled accrued amount
-     */
-    function _calculateAccrual(
-        BaseYieldAccrual memory accrual
-    ) internal view returns (uint256) {
-        /* If accrual is not yet initialized, return 0 */
-        if (accrual.timestamp == 0) return 0;
-
-        /* Calculate time elapsed */
-        uint256 timeElapsed = block.timestamp - accrual.timestamp;
-
-        /* If time elapsed is 0, return 0 */
-        if (timeElapsed == 0) return 0;
-
-        /* Iterate over rate tiers */
-        uint256 principal = _scale(_baseToken.balanceOf(address(this)));
-        uint256 accrued;
-        for (uint256 i; i < accrual.rateTiers.length; i++) {
-            /* Calculate clamped scaled principal */
-            uint256 clampedPrincipal = Math.min(principal, accrual.rateTiers[i].threshold);
-
-            /* Compute clamped principal * rate * time elapsed */
-            accrued += Math.mulDiv(clampedPrincipal, accrual.rateTiers[i].rate * timeElapsed, FIXED_POINT_SCALE);
-
-            /* Update principal remaining */
-            principal -= clampedPrincipal;
-        }
-
-        return accrued;
-    }
-
-    /**
-     * @notice Accrue base yield
-     * @return Scaled accrued amount
-     */
-    function _accrue() internal returns (uint256) {
-        /* Get base yield rate */
-        BaseYieldAccrual storage accrual = _getBaseYieldAccrualStorage();
-
-        /* Update accrual */
-        accrual.accrued += _calculateAccrual(accrual);
-        accrual.timestamp = uint64(block.timestamp);
-
-        return accrual.accrued;
     }
 
     /*------------------------------------------------------------------------*/
@@ -550,7 +520,10 @@ contract USDai is
     /**
      * @inheritdoc IMintableBurnable
      */
-    function mint(address to, uint256 amount) external onlyRole(BRIDGE_ADMIN_ROLE) {
+    function mint(
+        address to,
+        uint256 amount
+    ) external onlyRole(BRIDGE_ADMIN_ROLE) {
         _mint(to, amount);
 
         /* Update bridged supply */
@@ -560,7 +533,10 @@ contract USDai is
     /**
      * @inheritdoc IMintableBurnable
      */
-    function burn(address from, uint256 amount) external onlyRole(BRIDGE_ADMIN_ROLE) {
+    function burn(
+        address from,
+        uint256 amount
+    ) external onlyRole(BRIDGE_ADMIN_ROLE) {
         _burn(from, amount);
 
         /* Update bridged supply */
@@ -578,53 +554,20 @@ contract USDai is
         /* Validate caller is the base yield recipient */
         if (msg.sender != _baseYieldRecipient) revert InvalidAddress();
 
-        /* Base token amount */
-        uint256 baseTokenAmount = _unscale(_accrue());
+        /* Claim yield from MultiMint — mints MultiMint to this contract */
+        uint256 claimed = IMultiMint(address(_baseToken)).claimYield();
+        if (claimed == 0) return 0;
 
-        /* Set accrued base yield to zero */
-        _getBaseYieldAccrualStorage().accrued = 0;
-
-        /* Scale base token amount to USDai amount */
-        uint256 usdaiAmount = _scale(baseTokenAmount);
+        /* Scale to USDai (18d) */
+        uint256 usdaiAmount = _scale(claimed);
 
         /* Mint USDai to base yield recipient */
         _mint(_baseYieldRecipient, usdaiAmount);
-
-        /* Pull base token from escrow contract */
-        _baseYieldEscrow.harvest(baseTokenAmount);
 
         /* Emit harvested event */
         emit Harvested(usdaiAmount);
 
         return usdaiAmount;
-    }
-
-    /*------------------------------------------------------------------------*/
-    /* Base Yield Escrow API */
-    /*------------------------------------------------------------------------*/
-
-    /**
-     * @inheritdoc IUSDai
-     */
-    function setRateTiers(
-        RateTier[] memory rateTiers
-    ) external {
-        /* Validate caller is the base yield escrow */
-        if (msg.sender != address(_baseYieldEscrow)) revert InvalidAddress();
-
-        /* Validate rate tiers */
-        for (uint256 i; i < rateTiers.length; i++) {
-            if (rateTiers[i].rate == 0 || rateTiers[i].threshold == 0) revert InvalidParameters();
-        }
-
-        /* Accrue base yield */
-        _accrue();
-
-        /* Set rate tiers */
-        _getBaseYieldAccrualStorage().rateTiers = rateTiers;
-
-        /* Emit rate tiers set event */
-        emit BaseYieldRateTiersSet(rateTiers);
     }
 
     /*------------------------------------------------------------------------*/
@@ -646,7 +589,10 @@ contract USDai is
     /**
      * @inheritdoc IUSDai
      */
-    function setBlacklist(address account, bool blacklisted) external onlyRole(BLACKLIST_ADMIN_ROLE) {
+    function setBlacklist(
+        address account,
+        bool blacklisted
+    ) external onlyRole(BLACKLIST_ADMIN_ROLE) {
         _getBlacklistStorage().blacklist[account] = blacklisted;
 
         /* Emit blacklist updated event */
@@ -654,36 +600,13 @@ contract USDai is
     }
 
     /**
-     * @notice Convert base token
-     * @param amount Amount
+     * @inheritdoc IUSDai
+     * @dev DEAD in v1.5 — always reverts. Kept for interface compatibility.
      */
-    function convertBaseToken(
-        uint256 amount
-    ) external onlyRole(CONVERT_BASE_TOKEN_ADMIN_ROLE) {
-        /* Wrapped M token */
-        address wrappedMToken = 0x437cc33344a0B27A429f795ff6B469C72698B291;
-
-        /* Validate amount */
-        if (IERC20(wrappedMToken).balanceOf(address(this)) < amount || amount == 0) {
-            revert InvalidAmount();
-        }
-
-        /* Set initial accrual timestamp to the current timestamp */
-        if (_getBaseYieldAccrualStorage().timestamp == 0) {
-            _getBaseYieldAccrualStorage().timestamp = uint64(block.timestamp);
-        }
-
-        /* Accrue base yield */
-        _accrue();
-
-        /* Transfer token to caller */
-        IERC20(wrappedMToken).safeTransfer(msg.sender, amount);
-
-        /* Transfer base token from caller to this contract */
-        _baseToken.safeTransferFrom(msg.sender, address(this), amount);
-
-        /* Emit converted base token event */
-        emit BaseTokenConverted(msg.sender, amount);
+    function setRateTiers(
+        RateTier[] memory
+    ) external pure {
+        revert InvalidParameters();
     }
 
     /*------------------------------------------------------------------------*/

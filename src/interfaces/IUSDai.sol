@@ -43,17 +43,14 @@ interface IUSDai is IERC20 {
      */
     error InvalidParameters();
 
+    /**
+     * @notice Insufficient backing
+     */
+    error InsufficientBacking();
+
     /*------------------------------------------------------------------------*/
     /* Structures */
     /*------------------------------------------------------------------------*/
-
-    /**
-     * @notice Rate tier
-     */
-    struct RateTier {
-        uint256 rate;
-        uint256 threshold;
-    }
 
     /**
      * @custom:storage-location erc7201:USDai.supply
@@ -65,11 +62,20 @@ interface IUSDai is IERC20 {
 
     /**
      * @custom:storage-location erc7201:USDai.baseYieldAccrual
+     * @dev DEAD — kept for storage layout compatibility. No reads or writes in v1.5.
      */
     struct BaseYieldAccrual {
         RateTier[] rateTiers;
         uint256 accrued;
         uint64 timestamp;
+    }
+
+    /**
+     * @dev DEAD — kept inside BaseYieldAccrual for storage layout compatibility.
+     */
+    struct RateTier {
+        uint256 rate;
+        uint256 threshold;
     }
 
     /**
@@ -141,19 +147,6 @@ interface IUSDai is IERC20 {
      */
     event SupplyCapSet(uint256 supplyCap);
 
-    /**
-     * @notice Base yield rate tiers set
-     * @param rateTiers Rate tiers
-     */
-    event BaseYieldRateTiersSet(RateTier[] rateTiers);
-
-    /**
-     * @notice Base token converted event
-     * @param converter Converter
-     * @param amount Amount
-     */
-    event BaseTokenConverted(address indexed converter, uint256 amount);
-
     /*------------------------------------------------------------------------*/
     /* Getters */
     /*------------------------------------------------------------------------*/
@@ -183,7 +176,7 @@ interface IUSDai is IERC20 {
     function supplyCap() external view returns (uint256);
 
     /**
-     * @notice Get base yield accrued
+     * @notice Get base yield accrued (DEAD — always returns 0 in v1.5)
      * @return Base yield accrued
      */
     function baseYieldAccrued() external view returns (uint256);
@@ -300,7 +293,7 @@ interface IUSDai is IERC20 {
     ) external;
 
     /**
-     * @notice Set rate tiers
+     * @notice Set rate tiers (DEAD in v1.5 — kept for BaseYieldEscrow compatibility)
      * @param rateTiers Rate tiers
      */
     function setRateTiers(
